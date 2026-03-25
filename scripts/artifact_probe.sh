@@ -1,0 +1,1 @@
+python src/artifact_probe.py --config_path configs/probe/baseline.yaml model.num_layers=12 model.model_dim=640
