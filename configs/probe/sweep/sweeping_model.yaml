@@ -1,0 +1,43 @@
+program: src/artifact_probe.py
+method: grid
+
+metric:
+  name: quant/compressed_submission_bytes
+  goal: minimize
+
+parameters:
+  model.num_layers:
+    values: [6, 9, 12, 15]
+
+  model.model_dim:
+    values: [256, 384, 512, 640, 768]
+
+  # keep the family fixed
+  model.head_dim:
+    value: 64
+
+  model.gqa_ratio:
+    value: 2
+
+  model.auto_derive_attention_shapes:
+    value: true
+
+  model.mlp_mult:
+    value: 2
+
+  model.tie_embeddings:
+    value: true
+
+  # keep quantization fixed for Phase A
+  quant.enabled:
+    value: true
+
+  quant.zlib_level:
+    value: 9
+
+command:
+  - .golf_param\Scripts\python.exe
+  - src/artifact_probe.py
+  - --config_path
+  - configs/probe/baseline.yaml
+  - ${args_no_hyphens}

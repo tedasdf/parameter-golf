@@ -1,5 +1,5 @@
 run:
-  run_id: baseline-probe
+  run_id: ""
   seed: 1337
   output_root: artifacts/runs/artifact_probe
   device: cpu

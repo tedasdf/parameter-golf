@@ -1,0 +1,61 @@
+program: src/artifact_probe.py
+method: grid
+
+metric:
+  name: quant/compressed_submission_bytes
+  goal: minimize
+
+parameters:
+  # fixed baseline model
+  model.num_layers:
+    value: 9
+
+  model.model_dim:
+    value: 512
+
+  model.head_dim:
+    value: 64
+
+  model.gqa_ratio:
+    value: 2
+
+  model.auto_derive_attention_shapes:
+    value: true
+
+  model.mlp_mult:
+    value: 2
+
+  model.tie_embeddings:
+    value: true
+
+  # fixed quant/export path
+  quant.enabled:
+    value: true
+
+  quant.zlib_level:
+    value: 9
+
+  quant.write_quant_artifact_to_disk:
+    value: true
+
+  # Phase B sweep knobs
+  quant.clip_percentile:
+    values: [99.9, 99.99, 99.999, 99.99984]
+
+  quant.keep_float_max_numel:
+    values: [0, 4096, 16384, 65536]
+
+  quant.per_row_scale_dtype:
+    values: ["float16", "float32"]
+
+  # keep these fixed for first pass
+  quant.keep_float_store_dtype:
+    value: "float16"
+
+
+command:
+  - .golf_param\Scripts\python.exe
+  - src/artifact_probe.py
+  - --config_path
+  - configs/probe/baseline.yaml
+  - ${args_no_hyphens}

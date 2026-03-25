@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from constant import MANIFEST_TEXT
 import numpy as np
-from quantiser import quantize_state_dict_int8
+from quantiser import dequantize_state_dict_int8, quantize_state_dict_int8
 import torch
 import wandb
 from omegaconf import OmegaConf
@@ -80,13 +80,14 @@ class ModelConfig:
     rope_base: float = 10000.0
     qk_gain_init: float = 1.0
     dtype: str = "bfloat16"  # float32 / float16 / bfloat16
-
-
+    head_dim: int = 64
+    gqa_ratio: int = 2
+    auto_derive_attention_shapes: bool = True
+    
 @dataclass
 class CodeConfig:
     enabled: bool = True
-    manifest_name: str = "code_manifest.txt"
-
+    
     config_file: str = "src/config.py"
     model_file: str = "src/model/gpt.py"
     optimizer_file: str = "src/model/optimizer.py"
@@ -101,6 +102,32 @@ class QuantConfig:
     artifact_name: str = "final_model.int8.ptz"
     write_quant_artifact_to_disk: bool = True
 
+    control_tensor_name_patterns: tuple[str, ...] = (
+        "attn_scale",
+        "attn_scales",
+        "mlp_scale",
+        "mlp_scales",
+        "resid_mix",
+        "resid_mixes",
+        "q_gain",
+        "skip_weight",
+        "skip_weights",
+    )
+    keep_float_fp32_name_patterns: tuple[str, ...] = (
+        "attn_scale",
+        "attn_scales",
+        "mlp_scale",
+        "mlp_scales",
+        "resid_mix",
+        "resid_mixes",
+        "q_gain",
+        "skip_weight",
+        "skip_weights",
+    )
+    keep_float_max_numel: int = 65_536
+    keep_float_store_dtype: str = "float16"
+    per_row_scale_dtype: str = "float16"
+    clip_percentile: float = 99.99984
 
 @dataclass
 class ArtifactProbeConfig:
@@ -208,6 +235,15 @@ def apply_model_dtype(model: torch.nn.Module, dtype_name: str) -> torch.nn.Modul
     return 
 
 def build_model(cfg: ArtifactProbeConfig, device: torch.device) -> torch.nn.Module:
+    if cfg.model.auto_derive_attention_shapes:
+        assert cfg.model.model_dim % cfg.model.head_dim == 0
+        num_heads = cfg.model.model_dim // cfg.model.head_dim
+        assert num_heads % cfg.model.gqa_ratio == 0
+        num_kv_heads = num_heads // cfg.model.gqa_ratio
+    else:
+        num_heads = cfg.model.num_heads
+        num_kv_heads = cfg.model.num_kv_heads
+    
     model = GPT(
         vocab_size=cfg.model.vocab_size,
         num_layers=cfg.model.num_layers,
@@ -235,13 +271,6 @@ def build_model(cfg: ArtifactProbeConfig, device: torch.device) -> torch.nn.Modu
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
-
-
-def get_logical_bytes(model: torch.nn.Module) -> tuple[int, int]:
-    param_bytes = sum(tensor_nbytes(p) for p in model.parameters())
-    buffer_bytes = sum(tensor_nbytes(b) for b in model.buffers())
-    return int(param_bytes), int(buffer_bytes)
-
 
 def get_serialized_state_dict_bytes(model: torch.nn.Module) -> int:
     state_dict_cpu = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
@@ -275,16 +304,66 @@ def render_code_manifest(cfg: CodeConfig) -> str:
     return rendered
 
 
-def write_rendered_manifest(cfg: CodeConfig, out_path: Path) -> int:
+def write_rendered_manifest(cfg: CodeConfig) -> int:
     rendered = render_code_manifest(cfg)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(rendered, encoding="utf-8")
+    # out_path.parent.mkdir(parents=True, exist_ok=True)
+    # out_path.write_text(rendered, encoding="utf-8")
     return len(rendered.encode("utf-8"))
 
 # ============================================================
 # Quantization helpers
 # Reused from your current export logic
 # ============================================================
+
+
+def compare_state_dicts(
+    original: dict[str, Tensor],
+    restored: dict[str, Tensor],
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    max_abs = 0.0
+    sum_abs = 0.0
+    total_numel = 0
+
+    diff_sq_sum = 0.0
+    ref_sq_sum = 0.0
+    max_rel = 0.0
+
+    for name, orig in original.items():
+        orig_cpu = orig.detach().to("cpu").contiguous()
+
+        if not orig_cpu.is_floating_point():
+            continue
+
+        rec = restored[name].detach().to("cpu").contiguous()
+
+        ref = orig_cpu.float()
+        got = rec.float()
+        diff = (ref - got).abs()
+
+        if diff.numel() > 0:
+            max_abs = max(max_abs, float(diff.max().item()))
+            max_rel = max(
+                max_rel,
+                float((diff / ref.abs().clamp_min(eps)).max().item()),
+            )
+
+        sum_abs += float(diff.sum().item())
+        total_numel += diff.numel()
+
+        diff_sq_sum += float((ref - got).pow(2).sum().item())
+        ref_sq_sum += float(ref.pow(2).sum().item())
+
+    mean_abs = sum_abs / max(total_numel, 1)
+    rel_l2 = (diff_sq_sum ** 0.5) / max(ref_sq_sum ** 0.5, eps)
+
+    return {
+        "quant/error_max_abs": max_abs,
+        "quant/error_mean_abs": mean_abs,
+        "quant/error_rel_l2": rel_l2,
+        "quant/error_max_rel": max_rel,
+    }
+
 
 def probe_quantized_artifact(
     model: torch.nn.Module,
@@ -293,17 +372,27 @@ def probe_quantized_artifact(
     cfg: QuantConfig,
 ) -> dict[str, int | float]:
     metrics: dict[str, int | float] = {
-        "artifact/int8_payload_bytes": 0,
-        "artifact/quant_raw_bytes": 0,
-        "artifact/compressed_artifact_bytes": 0,
-        "artifact/compressed_submission_bytes": 0,
-        "artifact/payload_ratio": 0.0,
+        "quant/int8_payload_bytes": 0,
+        "quant/quant_raw_bytes": 0,
+        "quant/compressed_artifact_bytes": 0,
+        "quant/compressed_submission_bytes": 0,
+        "quant/payload_ratio": 0.0,
+        "quant/error_max_abs": 0.0,
+        "quant/error_mean_abs": 0.0,
+        "quant/error_rel_l2": 0.0,
+        "quant/error_max_rel": 0.0,
     }
 
     if not cfg.enabled:
         return metrics
 
-    quant_obj, quant_stats = quantize_state_dict_int8(model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(model.state_dict(), cfg.quant)
+    original_state = {
+        k: v.detach().to("cpu").contiguous()
+        for k, v in model.state_dict().items()
+    }
+    restored_state = dequantize_state_dict_int8(quant_obj)
+    error_metrics = compare_state_dicts(original_state, restored_state)
 
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
@@ -323,26 +412,41 @@ def probe_quantized_artifact(
 
     metrics.update(
         {
-            "artifact/int8_payload_bytes": int(quant_stats["int8_payload_bytes"]),
-            "artifact/quant_raw_bytes": int(quant_raw_bytes),
-            "artifact/compressed_artifact_bytes": int(compressed_artifact_bytes),
-            "artifact/compressed_submission_bytes": int(compressed_submission_bytes),
-            "artifact/payload_ratio": float(ratio),
+            "quant/int8_payload_bytes": int(quant_stats["int8_payload_bytes"]),
+            "quant/quant_raw_bytes": int(quant_raw_bytes),
+            "quant/compressed_artifact_bytes": int(compressed_artifact_bytes),
+            "quant/compressed_submission_bytes": int(compressed_submission_bytes),
+            "quant/payload_ratio": float(ratio),
+            **error_metrics,
         }
     )
     return metrics
 
-
 # ============================================================
 # Main
 # ============================================================
-
 def main() -> None:
     cli_args = parse_args()
     cfg = load_cfg(cli_args.config_path, cli_args.overrides)
 
     seed_everything(cfg.run.seed)
     master_process = is_master_process()
+
+    wandb_run = None
+
+    if master_process:
+        wandb_run = wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity or None,
+            mode=cfg.wandb.mode,
+            tags=cfg.wandb.tags,
+            config=to_flat_dict(cfg),
+        )
+
+    if not cfg.run.run_id:
+        cfg.run.run_id = (
+            wandb_run.id if wandb_run is not None else f"artifact-probe-{uuid.uuid4().hex[:8]}"
+        )
 
     run_dir = Path(cfg.run.output_root) / cfg.run.run_id
     if master_process:
@@ -354,16 +458,6 @@ def main() -> None:
 
     device = resolve_device(cfg.run.device)
 
-    wandb_run = None
-    if master_process:
-        wandb_run = wandb.init(
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity or None,
-            name=cfg.run.run_id,
-            mode=cfg.wandb.mode,
-            tags=cfg.wandb.tags,
-            config=to_flat_dict(cfg),
-        )
 
     t0 = time.perf_counter()
 
@@ -380,14 +474,12 @@ def main() -> None:
     trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     buffer_count = sum(b.numel() for b in model.buffers())
 
-    param_bytes, buffer_bytes = get_logical_bytes(model)
     raw_model_bytes = get_serialized_state_dict_bytes(model)
-    manifest_path = run_dir / cfg.code.manifest_name
     code_manifest_bytes = 0
 
     if cfg.code.enabled:
         if master_process:
-            code_manifest_bytes = write_rendered_manifest(cfg.code, manifest_path)
+            code_manifest_bytes = write_rendered_manifest(cfg.code)
         else:
             rendered = render_code_manifest(cfg.code)
             code_manifest_bytes = len(rendered.encode("utf-8"))
@@ -402,17 +494,6 @@ def main() -> None:
         cfg=cfg.quant,
     )
 
-    cuda_allocated_mb = 0.0
-    cuda_reserved_mb = 0.0
-    cuda_peak_allocated_mb = 0.0
-    cuda_peak_reserved_mb = 0.0
-
-    if device.type == "cuda":
-        cuda_allocated_mb = float(torch.cuda.memory_allocated(device) / (1024 ** 2))
-        cuda_reserved_mb = float(torch.cuda.memory_reserved(device) / (1024 ** 2))
-        cuda_peak_allocated_mb = float(torch.cuda.max_memory_allocated(device) / (1024 ** 2))
-        cuda_peak_reserved_mb = float(torch.cuda.max_memory_reserved(device) / (1024 ** 2))
-
     if master_process and cfg.run.save_raw_state_dict:
         raw_state_path = run_dir / "final_model.pt"
         state_dict_cpu = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
@@ -420,35 +501,13 @@ def main() -> None:
 
     summary = {
         "run_id": cfg.run.run_id,
-        "device": str(device),
+        # "device": str(device),
         "model/param_count": int(param_count),
         "model/trainable_param_count": int(trainable_param_count),
-        "model/buffer_count": int(buffer_count),
-        "model/param_bytes_logical": int(param_bytes),
-        "model/buffer_bytes_logical": int(buffer_bytes),
-        "artifact/raw_model_bytes": int(raw_model_bytes),
-        "artifact/code_manifest_bytes": int(code_manifest_bytes),
-        "artifact/code_manifest_bytes": int(code_manifest_bytes),
-        "artifact/raw_submission_bytes": int(raw_submission_bytes),
-        "runtime/init_wallclock_sec": float(init_wallclock_sec),
-        "memory/cuda_allocated_mb_after_init": float(cuda_allocated_mb),
-        "memory/cuda_reserved_mb_after_init": float(cuda_reserved_mb),
-        "memory/cuda_peak_allocated_mb_after_init": float(cuda_peak_allocated_mb),
-        "memory/cuda_peak_reserved_mb_after_init": float(cuda_peak_reserved_mb),
-        "model/tie_embeddings": bool(cfg.model.tie_embeddings),
-        "model/num_layers": int(cfg.model.num_layers),
-        "model/model_dim": int(cfg.model.model_dim),
-        "model/num_heads": int(cfg.model.num_heads),
-        "model/num_kv_heads": int(cfg.model.num_kv_heads),
-        "model/mlp_mult": float(cfg.model.mlp_mult),
-        "model/logit_softcap": float(cfg.model.logit_softcap),
-        "model/dtype": cfg.model.dtype,
         **quant_metrics,
     }
 
     if master_process:
-        with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
 
         if wandb_run is not None:
             wandb.log(summary)
