@@ -1,0 +1,39 @@
+run:
+  run_id: baseline-probe
+  seed: 1337
+  output_root: artifacts/runs/artifact_probe
+  device: cpu
+  save_raw_state_dict: false
+wandb:
+  enabled: true
+  project: parameter-golf
+  entity: ''
+  mode: online
+  tags:
+  - artifact-probe
+  - baseline
+model:
+  vocab_size: 1024
+  num_layers: 9
+  model_dim: 512
+  num_heads: 8
+  num_kv_heads: 4
+  mlp_mult: 2
+  tie_embeddings: true
+  tied_embed_init_std: 0.5
+  logit_softcap: 30.0
+  rope_base: 10000.0
+  qk_gain_init: 1.0
+  dtype: bfloat16
+code:
+  enabled: true
+  manifest_name: code_manifest.txt
+  config_file: src/config.py
+  model_file: src/model/gpt.py
+  optimizer_file: src/model/optimizer.py
+  include_optimizer_code: false
+quant:
+  enabled: true
+  zlib_level: 9
+  artifact_name: final_model.int8.ptz
+  write_quant_artifact_to_disk: true

@@ -61,10 +61,10 @@ MANIFEST_TEXT = r"""
     import torch.nn.functional as F
     from torch import Tensor, nn
     from torch.nn.parallel import DistributedDataParallel as DDP
-    
+
     <<CONFIG_CODE>>
 
-    <<OPTIMIZER CODE>>
+    <<OPTIMIZER_CODE>>
         
     def build_sentencepiece_luts(
         sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device

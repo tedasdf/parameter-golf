@@ -8,7 +8,7 @@
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 # compute storage size in bytes
-from src.constant import INT8_CLIP_Q, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS, INT8_KEEP_FLOAT_MAX_NUMEL, INT8_KEEP_FLOAT_STORE_DTYPE, INT8_PER_ROW_SCALE_DTYPE
+from constant import INT8_CLIP_Q, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS, INT8_KEEP_FLOAT_MAX_NUMEL, INT8_KEEP_FLOAT_STORE_DTYPE, INT8_PER_ROW_SCALE_DTYPE
 from torch import Tensor
 import torch
 

@@ -1,0 +1,106 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        code_path: code/src/artifact_probe.py
+        e:
+            87lnpghb7f7nhjp0a2di40jcv9z3h2m5:
+                args:
+                    - --config_path
+                    - configs/probe/baseline.yaml
+                codePath: src\artifact_probe.py
+                codePathLocal: src\artifact_probe.py
+                email: teedsingyau@gmail.com
+                executable: C:\Users\teeds\Documents\GitHub\parameter-golf\.golf_param\Scripts\python.exe
+                git:
+                    commit: f152cdc2085a0547b5b20ce6e3f67219c06bcdcd
+                    remote: https://github.com/tedasdf/parameter-golf.git
+                host: Teddys
+                os: Windows-11-10.0.26200-SP0
+                program: C:\Users\teeds\Documents\GitHub\parameter-golf\src\artifact_probe.py
+                python: CPython 3.12.12
+                root: C:\Users\teeds\Documents\GitHub\parameter-golf
+                startedAt: "2026-03-25T01:10:20.401061Z"
+                writerId: 87lnpghb7f7nhjp0a2di40jcv9z3h2m5
+        m: []
+        python_version: 3.12.12
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 15
+                - 16
+            "4": 3.12.12
+            "5": 0.25.1
+            "8":
+                - 3
+            "12": 0.25.1
+            "13": windows-arm64
+code.config_file:
+    value: src/config.py
+code.enabled:
+    value: true
+code.include_optimizer_code:
+    value: false
+code.manifest_name:
+    value: code_manifest.txt
+code.model_file:
+    value: src/model/gpt.py
+code.optimizer_file:
+    value: src/model/optimizer.py
+model.dtype:
+    value: bfloat16
+model.logit_softcap:
+    value: 30
+model.mlp_mult:
+    value: 2
+model.model_dim:
+    value: 512
+model.num_heads:
+    value: 8
+model.num_kv_heads:
+    value: 4
+model.num_layers:
+    value: 9
+model.qk_gain_init:
+    value: 1
+model.rope_base:
+    value: 10000
+model.tie_embeddings:
+    value: true
+model.tied_embed_init_std:
+    value: 0.5
+model.vocab_size:
+    value: 1024
+quant.artifact_name:
+    value: final_model.int8.ptz
+quant.enabled:
+    value: true
+quant.write_quant_artifact_to_disk:
+    value: true
+quant.zlib_level:
+    value: 9
+run.device:
+    value: cpu
+run.output_root:
+    value: artifacts/runs/artifact_probe
+run.run_id:
+    value: baseline-probe
+run.save_raw_state_dict:
+    value: false
+run.seed:
+    value: 1337
+wandb.enabled:
+    value: true
+wandb.entity:
+    value: ""
+wandb.mode:
+    value: online
+wandb.project:
+    value: parameter-golf
+wandb.tags:
+    value:
+        - artifact-probe
+        - baseline

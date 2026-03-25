@@ -317,15 +317,6 @@ def main() -> None:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
         print(logfile)
-
-    def log0(msg: str, console: bool = True) -> None:
-        if not master_process:
-            return
-        if console:
-            print(msg)
-        if logfile is not None:
-            with open(logfile, "a", encoding="utf-8") as f:
-                print(msg, file=f)
     
     def wandb_log(payload: dict, step_value: int | None = None) -> None:
         if master_process and wandb_run is not None:
@@ -333,16 +324,13 @@ def main() -> None:
                 wandb.log(payload)
             else:
                 wandb.log(payload, step=step_value)
-    
-    log0(code, console=False)
-    log0("=" * 100, console=False)
-    log0(f"Running Python {sys.version}", console=False)
-    log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
+
+    print("=" * 100, console=False)
+    print(
         subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
         console=False,
     )
-    log0("=" * 100, console=False)
+    print("=" * 100, console=False)
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -366,10 +354,7 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-
+    
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
@@ -444,22 +429,8 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
-    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
-        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    log0(f"seed:{args.seed}")
-
+    print(f"model_params:{n_params}")
+    
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -502,7 +473,7 @@ def main() -> None:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                print(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -561,11 +532,6 @@ def main() -> None:
 
             eval_tokens_processed += int(val_tokens.numel() - 1)
 
-            log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms eval_time:{last_eval_time_ms:.0f}ms "
-                f"step_avg:{training_time_ms / max(step, 1):.2f}ms"
-            )
 
             wandb_log(
                 {
@@ -586,7 +552,7 @@ def main() -> None:
             if stop_after_step is not None and step < args.iterations:
                 stop_reason = "wallclock_cap"
                 cap_hit = 1
-                log0(
+                print(
                     f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
                     f"step:{step}/{args.iterations}"
                 )
@@ -651,11 +617,6 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
-            log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{step_time_ms:.2f}ms "
-                f"tok/s:{tokens_per_sec:.2f} grad_norm:{float(grad_norm):.4f}"
-            )
 
             wandb_log(
                 {
@@ -692,10 +653,6 @@ def main() -> None:
         step_value=step,
     )
 
-    log0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -704,6 +661,10 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
+        
+        torch.save(base_model.state_dict(), "final_model.pt")
+        model_bytes = os.path.getsize("final_model.pt")
+        code_bytes = len(code.encode("utf-8"))
         wandb_log(
             {
                 "artifact/raw_model_bytes": int(model_bytes),
@@ -712,12 +673,10 @@ def main() -> None:
             },
             step_value=step,
         )
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
-        code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
-        log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        
+        print(f"Serialized model: {model_bytes} bytes")
+        print(f"Code size: {code_bytes} bytes")
+        print(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
@@ -742,11 +701,11 @@ def main() -> None:
             },
             step_value=step,
         )
-        log0(
+        print(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        print(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
@@ -768,8 +727,8 @@ def main() -> None:
         has_leading_space_lut,
         is_boundary_token_lut,
     )
-    qeval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
     torch.cuda.synchronize()
+    qeval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
     postquant_delta_bpb = float(q_val_bpb - val_bpb)
     postquant_delta_loss = float(q_val_loss - val_loss)
 
@@ -785,35 +744,33 @@ def main() -> None:
     )
     
     
-    log0(
+    print(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    print(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if master_process and wandb_run is not None:
+        wandb_run.summary["summary/train_wallclock_sec"] = training_time_ms / 1000.0
+        wandb_run.summary["summary/eval_wallclock_sec_total"] = val_eval_time_ms_total / 1000.0
+        wandb_run.summary["summary/postquant_eval_wallclock_sec"] = qeval_time_ms / 1000.0
+        wandb_run.summary["summary/avg_train_step_time_ms"] = training_time_ms / max(step, 1)
+        wandb_run.summary["summary/final_train_tokens_processed"] = train_tokens_processed
+        wandb_run.summary["summary/final_eval_tokens_processed"] = eval_tokens_processed
+        wandb_run.summary["summary/final_val_loss"] = float(val_loss)
+        wandb_run.summary["summary/final_val_bpb"] = float(val_bpb)
+        wandb_run.summary["summary/postquant_val_loss"] = float(q_val_loss)
+        wandb_run.summary["summary/postquant_val_bpb"] = float(q_val_bpb)
+        wandb_run.summary["summary/postquant_delta_bpb"] = float(postquant_delta_bpb)
+        wandb_run.summary["summary/peak_allocated_mb"] = float(torch.cuda.max_memory_allocated() / (1024 ** 2))
+        wandb_run.summary["summary/peak_reserved_mb"] = float(torch.cuda.max_memory_reserved() / (1024 ** 2))
+        wandb_run.summary["summary/steps_completed"] = int(step)
+        wandb_run.summary["summary/cap_hit"] = int(cap_hit)
+        wandb_run.summary["summary/stop_reason"] = stop_reason
+        wandb_run.finish()
 
     if distributed:
-        if master_process and wandb_run is not None:
-            wandb_run.summary["summary/train_wallclock_sec"] = training_time_ms / 1000.0
-            wandb_run.summary["summary/eval_wallclock_sec_total"] = val_eval_time_ms_total / 1000.0
-            wandb_run.summary["summary/postquant_eval_wallclock_sec"] = qeval_time_ms / 1000.0
-            wandb_run.summary["summary/avg_train_step_time_ms"] = training_time_ms / max(step, 1)
-            wandb_run.summary["summary/final_train_tokens_processed"] = train_tokens_processed
-            wandb_run.summary["summary/final_eval_tokens_processed"] = eval_tokens_processed
-            wandb_run.summary["summary/final_val_loss"] = float(val_loss)
-            wandb_run.summary["summary/final_val_bpb"] = float(val_bpb)
-            wandb_run.summary["summary/postquant_val_loss"] = float(q_val_loss)
-            wandb_run.summary["summary/postquant_val_bpb"] = float(q_val_bpb)
-            wandb_run.summary["summary/postquant_delta_bpb"] = float(postquant_delta_bpb)
-            wandb_run.summary["summary/peak_allocated_mb"] = float(torch.cuda.max_memory_allocated() / (1024 ** 2))
-            wandb_run.summary["summary/peak_reserved_mb"] = float(torch.cuda.max_memory_reserved() / (1024 ** 2))
-            wandb_run.summary["summary/steps_completed"] = int(step)
-            wandb_run.summary["summary/cap_hit"] = int(cap_hit)
-            wandb_run.summary["summary/stop_reason"] = stop_reason
-
-            if master_process:
-                wandb_run.finish()
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()

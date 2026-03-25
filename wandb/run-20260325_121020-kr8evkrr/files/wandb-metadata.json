@@ -1,0 +1,21 @@
+{
+  "os": "Windows-11-10.0.26200-SP0",
+  "python": "CPython 3.12.12",
+  "startedAt": "2026-03-25T01:10:20.401061Z",
+  "args": [
+    "--config_path",
+    "configs/probe/baseline.yaml"
+  ],
+  "program": "C:\\Users\\teeds\\Documents\\GitHub\\parameter-golf\\src\\artifact_probe.py",
+  "codePath": "src\\artifact_probe.py",
+  "codePathLocal": "src\\artifact_probe.py",
+  "git": {
+    "remote": "https://github.com/tedasdf/parameter-golf.git",
+    "commit": "f152cdc2085a0547b5b20ce6e3f67219c06bcdcd"
+  },
+  "email": "teedsingyau@gmail.com",
+  "root": "C:\\Users\\teeds\\Documents\\GitHub\\parameter-golf",
+  "host": "Teddys",
+  "executable": "C:\\Users\\teeds\\Documents\\GitHub\\parameter-golf\\.golf_param\\Scripts\\python.exe",
+  "writerId": "87lnpghb7f7nhjp0a2di40jcv9z3h2m5"
+}

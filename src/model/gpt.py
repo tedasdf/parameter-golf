@@ -1,4 +1,4 @@
-from src.constant import CONTROL_TENSOR_NAME_PATTERNS
+from constant import CONTROL_TENSOR_NAME_PATTERNS
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F

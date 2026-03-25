@@ -1,0 +1,836 @@
+diff --git a/configs/probe.yaml b/configs/probe.yaml
+deleted file mode 100644
+index f10dfb1..0000000
+--- a/configs/probe.yaml
++++ /dev/null
+@@ -1,39 +0,0 @@
+-run:
+-  run_id: baseline-probe
+-  seed: 1337
+-  output_root: artifacts/runs/artifact_probe
+-  device: cuda
+-  save_raw_state_dict: false
+-
+-wandb:
+-  enabled: true
+-  project: parameter-golf
+-  entity: ""
+-  mode: online
+-  tags: ["artifact-probe", "baseline"]
+-
+-model:
+-  vocab_size: 1024
+-  num_layers: 9
+-  model_dim: 512
+-  num_heads: 8
+-  num_kv_heads: 4
+-  mlp_mult: 2.0
+-  tie_embeddings: true
+-  tied_embed_init_std: 0.5
+-  logit_softcap: 30.0
+-  rope_base: 10000.0
+-  qk_gain_init: 1.0
+-  dtype: bfloat16
+-
+-code:
+-  enabled: true
+-  manifest_name: code_manifest.txt
+-
+-  config_file: src/config.py
+-  model_file: src/model/gpt.py
+-  optimizer_file: src/model/optimizer.py
+-
+-  include_config_code: true
+-  include_model_code: true
+-  include_optimizer_code: false
+\ No newline at end of file
+diff --git a/src/artifact_probe.py b/src/artifact_probe.py
+index a38cb65..0adc7d7 100644
+--- a/src/artifact_probe.py
++++ b/src/artifact_probe.py
+@@ -3,19 +3,45 @@ from __future__ import annotations
+ import argparse
+ import io
+ import json
++import os
+ import random
+ import time
+ import uuid
++import zlib
+ from dataclasses import asdict, dataclass, field
+ from pathlib import Path
+ from typing import Any
+-
++from constant import MANIFEST_TEXT
+ import numpy as np
++from quantiser import quantize_state_dict_int8
+ import torch
+ import wandb
+ from omegaconf import OmegaConf
+-
+-from model.gpt import GPT, CastedLinear, restore_low_dim_params_to_fp32
++from torch import Tensor
++
++# ------------------------------------------------------------
++# Imports
++# Adjust automatically depending on whether you run from repo root
++# or from inside src-style imports.
++# ------------------------------------------------------------
++try:
++    from model.gpt import GPT, CastedLinear, restore_low_dim_params_to_fp32
++    from constant import (
++        INT8_CLIP_Q,
++        INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
++        INT8_KEEP_FLOAT_MAX_NUMEL,
++        INT8_KEEP_FLOAT_STORE_DTYPE,
++        INT8_PER_ROW_SCALE_DTYPE,
++    )
++except ImportError:
++    from model.gpt import GPT, CastedLinear, restore_low_dim_params_to_fp32
++    from constant import (
++        INT8_CLIP_Q,
++        INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
++        INT8_KEEP_FLOAT_MAX_NUMEL,
++        INT8_KEEP_FLOAT_STORE_DTYPE,
++        INT8_PER_ROW_SCALE_DTYPE,
++    )
+ 
+ 
+ # ============================================================
+@@ -36,7 +62,7 @@ class WandbConfig:
+     enabled: bool = True
+     project: str = "parameter-golf"
+     entity: str = ""
+-    mode: str = "online"   # online / offline / disabled
++    mode: str = "online"  # online / offline / disabled
+     tags: list[str] = field(default_factory=lambda: ["artifact-probe"])
+ 
+ 
+@@ -47,13 +73,13 @@ class ModelConfig:
+     model_dim: int = 512
+     num_heads: int = 8
+     num_kv_heads: int = 4
+-    mlp_mult: float = 2.0
++    mlp_mult: int = 2
+     tie_embeddings: bool = True
+     tied_embed_init_std: float = 0.5
+     logit_softcap: float = 30.0
+     rope_base: float = 10000.0
+     qk_gain_init: float = 1.0
+-    dtype: str = "bfloat16"   # float32 / float16 / bfloat16
++    dtype: str = "bfloat16"  # float32 / float16 / bfloat16
+ 
+ 
+ @dataclass
+@@ -65,42 +91,32 @@ class CodeConfig:
+     model_file: str = "src/model/gpt.py"
+     optimizer_file: str = "src/model/optimizer.py"
+ 
+-    include_config_code: bool = True
+-    include_model_code: bool = True
+     include_optimizer_code: bool = False
+ 
+ 
++@dataclass
++class QuantConfig:
++    enabled: bool = True
++    zlib_level: int = 9
++    artifact_name: str = "final_model.int8.ptz"
++    write_quant_artifact_to_disk: bool = True
++
++
+ @dataclass
+ class ArtifactProbeConfig:
+     run: RunConfig = field(default_factory=RunConfig)
+     wandb: WandbConfig = field(default_factory=WandbConfig)
+     model: ModelConfig = field(default_factory=ModelConfig)
+     code: CodeConfig = field(default_factory=CodeConfig)
++    quant: QuantConfig = field(default_factory=QuantConfig)
+ 
+ 
+ # ============================================================
+-# Helpers
++# CLI / config helpers
+ # ============================================================
+ 
+-def get_code_files(cfg: ArtifactProbeConfig) -> list[str]:
+-    files: list[str] = []
+-
+-    if not cfg.code.enabled:
+-        return files
+-
+-    if cfg.code.include_config_code:
+-        files.append(cfg.code.config_file)
+-
+-    if cfg.code.include_model_code:
+-        files.append(cfg.code.model_file)
+-
+-    if cfg.code.include_optimizer_code:
+-        files.append(cfg.code.optimizer_file)
+-
+-    return files
+-
+ def parse_args() -> argparse.Namespace:
+-    parser = argparse.ArgumentParser(description="Probe model artifact/memory footprint.")
++    parser = argparse.ArgumentParser(description="Probe artifact size for a GPT config.")
+     parser.add_argument(
+         "--config_path",
+         type=str,
+@@ -110,7 +126,7 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument(
+         "overrides",
+         nargs="*",
+-        help="OmegaConf dotlist overrides, e.g. model.num_layers=12 model.model_dim=640",
++        help="OmegaConf dotlist overrides. Example: model.num_layers=12 model.model_dim=640",
+     )
+     return parser.parse_args()
+ 
+@@ -140,6 +156,22 @@ def load_cfg(config_path: str | None, overrides: list[str]) -> ArtifactProbeConf
+     return cfg_obj
+ 
+ 
++def to_flat_dict(cfg: ArtifactProbeConfig) -> dict[str, Any]:
++    raw = asdict(cfg)
++    flat: dict[str, Any] = {}
++
++    def _walk(prefix: str, value: Any) -> None:
++        if isinstance(value, dict):
++            for k, v in value.items():
++                next_prefix = f"{prefix}.{k}" if prefix else k
++                _walk(next_prefix, v)
++        else:
++            flat[prefix] = value
++
++    _walk("", raw)
++    return flat
++
++
+ def seed_everything(seed: int) -> None:
+     random.seed(seed)
+     np.random.seed(seed)
+@@ -156,20 +188,24 @@ def resolve_device(device_str: str) -> torch.device:
+     return torch.device(device_str)
+ 
+ 
+-def apply_model_dtype(model: torch.nn.Module, dtype_name: str) -> torch.nn.Module:
+-    dtype_name = dtype_name.lower()
++def is_master_process() -> bool:
++    return int(os.environ.get("RANK", "0")) == 0
+ 
+-    if dtype_name == "float32":
+-        model = model.float()
+-    elif dtype_name == "float16":
+-        model = model.half()
+-    elif dtype_name == "bfloat16":
+-        model = model.bfloat16()
+-    else:
+-        raise ValueError(f"Unsupported dtype: {dtype_name}")
+ 
+-    return model
++# ============================================================
++# Model helpers
++# ============================================================
+ 
++def apply_model_dtype(model: torch.nn.Module, dtype_name: str) -> torch.nn.Module:
++    dtype_name = dtype_name.lower()
++    if dtype_name == "float32":
++        return model.float()
++    if dtype_name == "float16":
++        return model.half()
++    if dtype_name == "bfloat16":
++        return model.bfloat16()
++    raise ValueError(f"Unsupported dtype: {dtype_name}")
++    return 
+ 
+ def build_model(cfg: ArtifactProbeConfig, device: torch.device) -> torch.nn.Module:
+     model = GPT(
+@@ -189,7 +225,6 @@ def build_model(cfg: ArtifactProbeConfig, device: torch.device) -> torch.nn.Modu
+     model = model.to(device)
+     model = apply_model_dtype(model, cfg.model.dtype)
+ 
+-    # Keep the same pattern you already use in training.
+     for module in model.modules():
+         if isinstance(module, CastedLinear):
+             module.float()
+@@ -198,29 +233,13 @@ def build_model(cfg: ArtifactProbeConfig, device: torch.device) -> torch.nn.Modu
+     return model
+ 
+ 
+-def tensor_bytes(t: torch.Tensor) -> int:
++def tensor_nbytes(t: Tensor) -> int:
+     return int(t.numel()) * int(t.element_size())
+ 
+ 
+-def dtype_breakdown_bytes(model: torch.nn.Module) -> dict[str, int]:
+-    breakdown: dict[str, int] = {}
+-    for p in model.parameters():
+-        key = str(p.dtype).removeprefix("torch.")
+-        breakdown[key] = breakdown.get(key, 0) + tensor_bytes(p)
+-    return breakdown
+-
+-
+-def buffer_breakdown_bytes(model: torch.nn.Module) -> dict[str, int]:
+-    breakdown: dict[str, int] = {}
+-    for b in model.buffers():
+-        key = str(b.dtype).removeprefix("torch.")
+-        breakdown[key] = breakdown.get(key, 0) + tensor_bytes(b)
+-    return breakdown
+-
+-
+ def get_logical_bytes(model: torch.nn.Module) -> tuple[int, int]:
+-    param_bytes = sum(tensor_bytes(p) for p in model.parameters())
+-    buffer_bytes = sum(tensor_bytes(b) for b in model.buffers())
++    param_bytes = sum(tensor_nbytes(p) for p in model.parameters())
++    buffer_bytes = sum(tensor_nbytes(b) for b in model.buffers())
+     return int(param_bytes), int(buffer_bytes)
+ 
+ 
+@@ -231,48 +250,87 @@ def get_serialized_state_dict_bytes(model: torch.nn.Module) -> int:
+     return len(buf.getvalue())
+ 
+ 
+-def write_code_manifest(files: list[str], out_path: Path) -> int:
+-    out_path.parent.mkdir(parents=True, exist_ok=True)
++# ============================================================
++# Code manifest helpers
++# ============================================================
+ 
+-    chunks: list[str] = []
+-    for file_str in files:
+-        path = Path(file_str)
+-        if not path.exists():
+-            chunks.append(f"===== {file_str} =====\n[MISSING FILE]\n")
+-            continue
++def read_text_if_exists(path_str: str) -> str:
++    path = Path(path_str)
++    if not path.exists():
++        return ""
++    return path.read_text(encoding="utf-8")
+ 
+-        text = path.read_text(encoding="utf-8")
+-        chunks.append(f"===== {file_str} =====\n{text}\n")
+ 
+-    manifest = "\n".join(chunks)
+-    out_path.write_text(manifest, encoding="utf-8")
+-    return len(manifest.encode("utf-8"))
++def render_code_manifest(cfg: CodeConfig) -> str:
++    config_code = read_text_if_exists(cfg.config_file)
++    model_code = read_text_if_exists(cfg.model_file)
++    optimizer_code = read_text_if_exists(cfg.optimizer_file) if cfg.include_optimizer_code else ""
+ 
++    rendered = (
++        MANIFEST_TEXT
++        .replace("<<CONFIG_CODE>>", config_code)
++        .replace("<<OPTIMIZER_CODE>>", optimizer_code)
++        .replace("<<MODEL_CODE>>", model_code)
++    )
++    return rendered
+ 
+-def count_existing_code_files_bytes(files: list[str]) -> int:
+-    total = 0
+-    for file_str in files:
+-        path = Path(file_str)
+-        if path.exists():
+-            total += path.stat().st_size
+-    return total
+ 
++def write_rendered_manifest(cfg: CodeConfig, out_path: Path) -> int:
++    rendered = render_code_manifest(cfg)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(rendered, encoding="utf-8")
++    return len(rendered.encode("utf-8"))
+ 
+-def to_flat_dict(cfg: ArtifactProbeConfig) -> dict[str, Any]:
+-    raw = asdict(cfg)
++# ============================================================
++# Quantization helpers
++# Reused from your current export logic
++# ============================================================
+ 
+-    flat: dict[str, Any] = {}
++def probe_quantized_artifact(
++    model: torch.nn.Module,
++    run_dir: Path,
++    code_bytes: int,
++    cfg: QuantConfig,
++) -> dict[str, int | float]:
++    metrics: dict[str, int | float] = {
++        "artifact/int8_payload_bytes": 0,
++        "artifact/quant_raw_bytes": 0,
++        "artifact/compressed_artifact_bytes": 0,
++        "artifact/compressed_submission_bytes": 0,
++        "artifact/payload_ratio": 0.0,
++    }
+ 
+-    def _walk(prefix: str, value: Any) -> None:
+-        if isinstance(value, dict):
+-            for k, v in value.items():
+-                next_prefix = f"{prefix}.{k}" if prefix else k
+-                _walk(next_prefix, v)
+-        else:
+-            flat[prefix] = value
++    if not cfg.enabled:
++        return metrics
+ 
+-    _walk("", raw)
+-    return flat
++    quant_obj, quant_stats = quantize_state_dict_int8(model.state_dict())
++
++    quant_buf = io.BytesIO()
++    torch.save(quant_obj, quant_buf)
++    quant_raw = quant_buf.getvalue()
++
++    quant_blob = zlib.compress(quant_raw, level=cfg.zlib_level)
++    quant_raw_bytes = len(quant_raw)
++    compressed_artifact_bytes = len(quant_blob)
++
++    if cfg.write_quant_artifact_to_disk:
++        out_path = run_dir / cfg.artifact_name
++        out_path.write_bytes(quant_blob)
++        compressed_artifact_bytes = out_path.stat().st_size
++
++    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
++    compressed_submission_bytes = compressed_artifact_bytes + code_bytes
++
++    metrics.update(
++        {
++            "artifact/int8_payload_bytes": int(quant_stats["int8_payload_bytes"]),
++            "artifact/quant_raw_bytes": int(quant_raw_bytes),
++            "artifact/compressed_artifact_bytes": int(compressed_artifact_bytes),
++            "artifact/compressed_submission_bytes": int(compressed_submission_bytes),
++            "artifact/payload_ratio": float(ratio),
++        }
++    )
++    return metrics
+ 
+ 
+ # ============================================================
+@@ -284,22 +342,28 @@ def main() -> None:
+     cfg = load_cfg(cli_args.config_path, cli_args.overrides)
+ 
+     seed_everything(cfg.run.seed)
++    master_process = is_master_process()
+ 
+     run_dir = Path(cfg.run.output_root) / cfg.run.run_id
+-    run_dir.mkdir(parents=True, exist_ok=True)
+-
+-    merged_cfg_path = run_dir / "resolved_config.yaml"
+-    merged_cfg_path.write_text(OmegaConf.to_yaml(OmegaConf.structured(cfg)), encoding="utf-8")
++    if master_process:
++        run_dir.mkdir(parents=True, exist_ok=True)
++        (run_dir / "resolved_config.yaml").write_text(
++            OmegaConf.to_yaml(OmegaConf.structured(cfg)),
++            encoding="utf-8",
++        )
+ 
+     device = resolve_device(cfg.run.device)
+ 
+-    wandb_run = wandb.init(
+-        project=cfg.wandb.project,
+-        entity=cfg.wandb.entity or None,
+-        name=cfg.run.run_id,
+-        mode=cfg.wandb.mode,
+-        tags=cfg.wandb.tags,
+-    )
++    wandb_run = None
++    if master_process:
++        wandb_run = wandb.init(
++            project=cfg.wandb.project,
++            entity=cfg.wandb.entity or None,
++            name=cfg.run.run_id,
++            mode=cfg.wandb.mode,
++            tags=cfg.wandb.tags,
++            config=to_flat_dict(cfg),
++        )
+ 
+     t0 = time.perf_counter()
+ 
+@@ -318,22 +382,26 @@ def main() -> None:
+ 
+     param_bytes, buffer_bytes = get_logical_bytes(model)
+     raw_model_bytes = get_serialized_state_dict_bytes(model)
+-
+-    param_dtype_bytes = dtype_breakdown_bytes(model)
+-    buffer_dtype_bytes = buffer_breakdown_bytes(model)
+-
+-    code_files = get_code_files(cfg)
+-
+-    code_manifest_bytes = 0
+-    code_disk_bytes = 0
+     manifest_path = run_dir / cfg.code.manifest_name
++    code_manifest_bytes = 0
++
++    if cfg.code.enabled:
++        if master_process:
++            code_manifest_bytes = write_rendered_manifest(cfg.code, manifest_path)
++        else:
++            rendered = render_code_manifest(cfg.code)
++            code_manifest_bytes = len(rendered.encode("utf-8"))
+ 
+-    if cfg.code.enabled and code_files:
+-        code_manifest_bytes = write_code_manifest(code_files, manifest_path)
+-        code_disk_bytes = count_existing_code_files_bytes(code_files)
+ 
+     raw_submission_bytes = raw_model_bytes + code_manifest_bytes
+ 
++    quant_metrics = probe_quantized_artifact(
++        model=model,
++        run_dir=run_dir,
++        code_bytes=code_manifest_bytes,
++        cfg=cfg.quant,
++    )
++
+     cuda_allocated_mb = 0.0
+     cuda_reserved_mb = 0.0
+     cuda_peak_allocated_mb = 0.0
+@@ -345,8 +413,8 @@ def main() -> None:
+         cuda_peak_allocated_mb = float(torch.cuda.max_memory_allocated(device) / (1024 ** 2))
+         cuda_peak_reserved_mb = float(torch.cuda.max_memory_reserved(device) / (1024 ** 2))
+ 
+-    if cfg.run.save_raw_state_dict:
+-        raw_state_path = run_dir / "model_state_dict.pt"
++    if master_process and cfg.run.save_raw_state_dict:
++        raw_state_path = run_dir / "final_model.pt"
+         state_dict_cpu = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+         torch.save(state_dict_cpu, raw_state_path)
+ 
+@@ -360,7 +428,7 @@ def main() -> None:
+         "model/buffer_bytes_logical": int(buffer_bytes),
+         "artifact/raw_model_bytes": int(raw_model_bytes),
+         "artifact/code_manifest_bytes": int(code_manifest_bytes),
+-        "artifact/code_disk_bytes": int(code_disk_bytes),
++        "artifact/code_manifest_bytes": int(code_manifest_bytes),
+         "artifact/raw_submission_bytes": int(raw_submission_bytes),
+         "runtime/init_wallclock_sec": float(init_wallclock_sec),
+         "memory/cuda_allocated_mb_after_init": float(cuda_allocated_mb),
+@@ -373,39 +441,23 @@ def main() -> None:
+         "model/num_heads": int(cfg.model.num_heads),
+         "model/num_kv_heads": int(cfg.model.num_kv_heads),
+         "model/mlp_mult": float(cfg.model.mlp_mult),
++        "model/logit_softcap": float(cfg.model.logit_softcap),
+         "model/dtype": cfg.model.dtype,
+-        "breakdown/param_dtype_bytes": param_dtype_bytes,
+-        "breakdown/buffer_dtype_bytes": buffer_dtype_bytes,
++        **quant_metrics,
+     }
+ 
+-    for k, v in summary.items():
+-        if isinstance(v, (int, float, bool, str)):
+-            wandb_run.summary[k] = v
+-
+-    wandb.log(
+-        {
+-            "model/param_count": int(param_count),
+-            "model/trainable_param_count": int(trainable_param_count),
+-            "model/buffer_count": int(buffer_count),
+-            "model/param_bytes_logical": int(param_bytes),
+-            "model/buffer_bytes_logical": int(buffer_bytes),
+-            "artifact/raw_model_bytes": int(raw_model_bytes),
+-            "artifact/code_manifest_bytes": int(code_manifest_bytes),
+-            "artifact/code_disk_bytes": int(code_disk_bytes),
+-            "artifact/raw_submission_bytes": int(raw_submission_bytes),
+-            "runtime/init_wallclock_sec": float(init_wallclock_sec),
+-            "memory/cuda_allocated_mb_after_init": float(cuda_allocated_mb),
+-            "memory/cuda_reserved_mb_after_init": float(cuda_reserved_mb),
+-            "memory/cuda_peak_allocated_mb_after_init": float(cuda_peak_allocated_mb),
+-            "memory/cuda_peak_reserved_mb_after_init": float(cuda_peak_reserved_mb),
+-        }
+-    )
++    if master_process:
++        with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
++            json.dump(summary, f, indent=2)
+ 
+-    with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
+-        json.dump(summary, f, indent=2)
++        if wandb_run is not None:
++            wandb.log(summary)
++            for k, v in summary.items():
++                if isinstance(v, (int, float, bool, str)):
++                    wandb_run.summary[k] = v
++            wandb_run.finish()
+ 
+     print(json.dumps(summary, indent=2))
+-    wandb_run.finish()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/constant.py b/src/constant.py
+index 10c1c45..9a43b2b 100644
+--- a/src/constant.py
++++ b/src/constant.py
+@@ -61,10 +61,10 @@ MANIFEST_TEXT = r"""
+     import torch.nn.functional as F
+     from torch import Tensor, nn
+     from torch.nn.parallel import DistributedDataParallel as DDP
+-    
++
+     <<CONFIG_CODE>>
+ 
+-    <<OPTIMIZER CODE>>
++    <<OPTIMIZER_CODE>>
+         
+     def build_sentencepiece_luts(
+         sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
+diff --git a/src/model/gpt.py b/src/model/gpt.py
+index f15d26a..c993ac5 100644
+--- a/src/model/gpt.py
++++ b/src/model/gpt.py
+@@ -1,4 +1,4 @@
+-from src.constant import CONTROL_TENSOR_NAME_PATTERNS
++from constant import CONTROL_TENSOR_NAME_PATTERNS
+ import torch
+ import torch.distributed as dist
+ import torch.nn.functional as F
+diff --git a/src/quantiser.py b/src/quantiser.py
+index 05b421a..e8df935 100644
+--- a/src/quantiser.py
++++ b/src/quantiser.py
+@@ -8,7 +8,7 @@
+ # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
+ 
+ # compute storage size in bytes
+-from src.constant import INT8_CLIP_Q, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS, INT8_KEEP_FLOAT_MAX_NUMEL, INT8_KEEP_FLOAT_STORE_DTYPE, INT8_PER_ROW_SCALE_DTYPE
++from constant import INT8_CLIP_Q, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS, INT8_KEEP_FLOAT_MAX_NUMEL, INT8_KEEP_FLOAT_STORE_DTYPE, INT8_PER_ROW_SCALE_DTYPE
+ from torch import Tensor
+ import torch
+ 
+diff --git a/src/train.py b/src/train.py
+index 864c61c..9470065 100644
+--- a/src/train.py
++++ b/src/train.py
+@@ -317,15 +317,6 @@ def main() -> None:
+         os.makedirs("logs", exist_ok=True)
+         logfile = f"logs/{args.run_id}.txt"
+         print(logfile)
+-
+-    def log0(msg: str, console: bool = True) -> None:
+-        if not master_process:
+-            return
+-        if console:
+-            print(msg)
+-        if logfile is not None:
+-            with open(logfile, "a", encoding="utf-8") as f:
+-                print(msg, file=f)
+     
+     def wandb_log(payload: dict, step_value: int | None = None) -> None:
+         if master_process and wandb_run is not None:
+@@ -333,16 +324,13 @@ def main() -> None:
+                 wandb.log(payload)
+             else:
+                 wandb.log(payload, step=step_value)
+-    
+-    log0(code, console=False)
+-    log0("=" * 100, console=False)
+-    log0(f"Running Python {sys.version}", console=False)
+-    log0(f"Running PyTorch {torch.__version__}", console=False)
+-    log0(
++
++    print("=" * 100, console=False)
++    print(
+         subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+         console=False,
+     )
+-    log0("=" * 100, console=False)
++    print("=" * 100, console=False)
+ 
+     # -----------------------------
+     # TOKENIZER + VALIDATION METRIC SETUP
+@@ -366,10 +354,7 @@ def main() -> None:
+     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+         sp, args.vocab_size, device
+     )
+-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+-
++    
+     # -----------------------------
+     # MODEL + OPTIMIZER SETUP
+     # -----------------------------
+@@ -444,22 +429,8 @@ def main() -> None:
+         optimizers.insert(1, optimizer_head)
+ 
+     n_params = sum(p.numel() for p in base_model.parameters())
+-    log0(f"model_params:{n_params}")
+-    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+-    log0(
+-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+-    )
+-    log0(
+-        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+-        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+-    )
+-    log0(f"seed:{args.seed}")
+-
++    print(f"model_params:{n_params}")
++    
+     # -----------------------------
+     # DATA LOADER & MODEL WARMUP
+     # -----------------------------
+@@ -502,7 +473,7 @@ def main() -> None:
+                 opt.step()
+             zero_grad_all()
+             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
++                print(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+         base_model.load_state_dict(initial_model_state, strict=True)
+         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+             opt.load_state_dict(state)
+@@ -561,11 +532,6 @@ def main() -> None:
+ 
+             eval_tokens_processed += int(val_tokens.numel() - 1)
+ 
+-            log0(
+-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+-                f"train_time:{training_time_ms:.0f}ms eval_time:{last_eval_time_ms:.0f}ms "
+-                f"step_avg:{training_time_ms / max(step, 1):.2f}ms"
+-            )
+ 
+             wandb_log(
+                 {
+@@ -586,7 +552,7 @@ def main() -> None:
+             if stop_after_step is not None and step < args.iterations:
+                 stop_reason = "wallclock_cap"
+                 cap_hit = 1
+-                log0(
++                print(
+                     f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                     f"step:{step}/{args.iterations}"
+                 )
+@@ -651,11 +617,6 @@ def main() -> None:
+             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+         )
+         if should_log_train:
+-            log0(
+-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{step_time_ms:.2f}ms "
+-                f"tok/s:{tokens_per_sec:.2f} grad_norm:{float(grad_norm):.4f}"
+-            )
+ 
+             wandb_log(
+                 {
+@@ -692,10 +653,6 @@ def main() -> None:
+         step_value=step,
+     )
+ 
+-    log0(
+-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+-    )
+ 
+     # -----------------------------
+     # SERIALIZATION + ROUNDTRIP VALIDATION
+@@ -704,6 +661,10 @@ def main() -> None:
+     # the compressed int8+zlib artifact and validate the round-tripped weights.
+ 
+     if master_process:
++        
++        torch.save(base_model.state_dict(), "final_model.pt")
++        model_bytes = os.path.getsize("final_model.pt")
++        code_bytes = len(code.encode("utf-8"))
+         wandb_log(
+             {
+                 "artifact/raw_model_bytes": int(model_bytes),
+@@ -712,12 +673,10 @@ def main() -> None:
+             },
+             step_value=step,
+         )
+-        torch.save(base_model.state_dict(), "final_model.pt")
+-        model_bytes = os.path.getsize("final_model.pt")
+-        code_bytes = len(code.encode("utf-8"))
+-        log0(f"Serialized model: {model_bytes} bytes")
+-        log0(f"Code size: {code_bytes} bytes")
+-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
++        
++        print(f"Serialized model: {model_bytes} bytes")
++        print(f"Code size: {code_bytes} bytes")
++        print(f"Total submission size: {model_bytes + code_bytes} bytes")
+ 
+     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+     quant_buf = io.BytesIO()
+@@ -742,11 +701,11 @@ def main() -> None:
+             },
+             step_value=step,
+         )
+-        log0(
++        print(
+             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+         )
+-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
++        print(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+ 
+     if distributed:
+         dist.barrier()
+@@ -768,8 +727,8 @@ def main() -> None:
+         has_leading_space_lut,
+         is_boundary_token_lut,
+     )
+-    qeval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
+     torch.cuda.synchronize()
++    qeval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
+     postquant_delta_bpb = float(q_val_bpb - val_bpb)
+     postquant_delta_loss = float(q_val_loss - val_loss)
+ 
+@@ -785,35 +744,33 @@ def main() -> None:
+     )
+     
+     
+-    log0(
++    print(
+         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+     )
+-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
++    print(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
++
++    if master_process and wandb_run is not None:
++        wandb_run.summary["summary/train_wallclock_sec"] = training_time_ms / 1000.0
++        wandb_run.summary["summary/eval_wallclock_sec_total"] = val_eval_time_ms_total / 1000.0
++        wandb_run.summary["summary/postquant_eval_wallclock_sec"] = qeval_time_ms / 1000.0
++        wandb_run.summary["summary/avg_train_step_time_ms"] = training_time_ms / max(step, 1)
++        wandb_run.summary["summary/final_train_tokens_processed"] = train_tokens_processed
++        wandb_run.summary["summary/final_eval_tokens_processed"] = eval_tokens_processed
++        wandb_run.summary["summary/final_val_loss"] = float(val_loss)
++        wandb_run.summary["summary/final_val_bpb"] = float(val_bpb)
++        wandb_run.summary["summary/postquant_val_loss"] = float(q_val_loss)
++        wandb_run.summary["summary/postquant_val_bpb"] = float(q_val_bpb)
++        wandb_run.summary["summary/postquant_delta_bpb"] = float(postquant_delta_bpb)
++        wandb_run.summary["summary/peak_allocated_mb"] = float(torch.cuda.max_memory_allocated() / (1024 ** 2))
++        wandb_run.summary["summary/peak_reserved_mb"] = float(torch.cuda.max_memory_reserved() / (1024 ** 2))
++        wandb_run.summary["summary/steps_completed"] = int(step)
++        wandb_run.summary["summary/cap_hit"] = int(cap_hit)
++        wandb_run.summary["summary/stop_reason"] = stop_reason
++        wandb_run.finish()
+ 
+     if distributed:
+-        if master_process and wandb_run is not None:
+-            wandb_run.summary["summary/train_wallclock_sec"] = training_time_ms / 1000.0
+-            wandb_run.summary["summary/eval_wallclock_sec_total"] = val_eval_time_ms_total / 1000.0
+-            wandb_run.summary["summary/postquant_eval_wallclock_sec"] = qeval_time_ms / 1000.0
+-            wandb_run.summary["summary/avg_train_step_time_ms"] = training_time_ms / max(step, 1)
+-            wandb_run.summary["summary/final_train_tokens_processed"] = train_tokens_processed
+-            wandb_run.summary["summary/final_eval_tokens_processed"] = eval_tokens_processed
+-            wandb_run.summary["summary/final_val_loss"] = float(val_loss)
+-            wandb_run.summary["summary/final_val_bpb"] = float(val_bpb)
+-            wandb_run.summary["summary/postquant_val_loss"] = float(q_val_loss)
+-            wandb_run.summary["summary/postquant_val_bpb"] = float(q_val_bpb)
+-            wandb_run.summary["summary/postquant_delta_bpb"] = float(postquant_delta_bpb)
+-            wandb_run.summary["summary/peak_allocated_mb"] = float(torch.cuda.max_memory_allocated() / (1024 ** 2))
+-            wandb_run.summary["summary/peak_reserved_mb"] = float(torch.cuda.max_memory_reserved() / (1024 ** 2))
+-            wandb_run.summary["summary/steps_completed"] = int(step)
+-            wandb_run.summary["summary/cap_hit"] = int(cap_hit)
+-            wandb_run.summary["summary/stop_reason"] = stop_reason
+-
+-            if master_process:
+-                wandb_run.finish()
+         dist.destroy_process_group()
+ 
+-
+ if __name__ == "__main__":
+     main()
