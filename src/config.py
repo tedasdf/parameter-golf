@@ -131,6 +131,7 @@ class QuantConfig:
 
 @dataclass
 class ArtifactProbeConfig:
+    run: RunConfig = field(default_factory=RunConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     code: CodeConfig = field(default_factory=CodeConfig)
     quant: QuantConfig = field(default_factory=QuantConfig)
