@@ -10,8 +10,8 @@
 # compute storage size in bytes
 from torch import Tensor
 import torch
+from config import QuantConfig
 
-from artifact_probe import QuantConfig
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
