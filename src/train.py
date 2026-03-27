@@ -7,13 +7,11 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import copy
-import glob
 import io
 import math
 import os
 import random
 import subprocess
-import sys
 import time
 import uuid
 import zlib
@@ -22,19 +20,17 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 from config import TrainExperimentConfig
-from model.gpt import GPT, CastedLinear, restore_low_dim_params_to_fp32
 from model.optimiser import Muon
 from constant import CONTROL_TENSOR_NAME_PATTERNS, INT8_CLIP_Q, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS, INT8_KEEP_FLOAT_MAX_NUMEL, INT8_KEEP_FLOAT_STORE_DTYPE, INT8_PER_ROW_SCALE_DTYPE
 from helper.data_load import DistributedTokenLoader, load_validation_tokens
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-import math
 import wandb
 
 from helper.quantiser import dequantize_state_dict_int8, quantize_state_dict_int8
+from model_builder import build_model
 
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
@@ -157,7 +153,7 @@ def main() -> None:
     optim_cfg = cfg.optimizer
     wandb_cfg = cfg.wandb
     model_cfg = cfg.model
-    code_cfg = cfg.code
+    # code_cfg = cfg.code
     quant_cfg = cfg.quant
 
     if not run_cfg.run_id:
@@ -171,15 +167,34 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size <= 0:
-        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
-    grad_scale = 1.0 / grad_accum_steps
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
+    
+    micro_batch_tokens_per_rank = train_cfg.micro_batch_tokens_per_rank
+    grad_accum_steps = train_cfg.grad_accum_steps
+
+    if micro_batch_tokens_per_rank <= 0:
+        raise ValueError("micro_batch_tokens_per_rank must be > 0")
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be > 0")
+    if micro_batch_tokens_per_rank < train_cfg.train_seq_len:
+        raise ValueError(
+            "micro_batch_tokens_per_rank must be at least train_seq_len "
+            f"(got {micro_batch_tokens_per_rank} vs {train_cfg.train_seq_len})"
+        )
+    if micro_batch_tokens_per_rank % train_cfg.train_seq_len != 0:
+        raise ValueError(
+            "micro_batch_tokens_per_rank must be divisible by train_seq_len "
+            f"(got {micro_batch_tokens_per_rank} vs {train_cfg.train_seq_len})"
+        )
+
+    effective_train_batch_tokens = (
+        micro_batch_tokens_per_rank * grad_accum_steps * world_size
+    )
+    grad_scale = 1.0 / grad_accum_steps
+
     torch.cuda.set_device(device)
     if distributed:
         dist.init_process_group(backend="nccl", device_id=device)
@@ -195,6 +210,16 @@ def main() -> None:
             mode=wandb_cfg.mode if wandb_cfg.enabled else "disabled",
             tags=wandb_cfg.tags,
         )
+        wandb_run.config.update(
+            {
+                "train.micro_batch_tokens_per_rank": int(micro_batch_tokens_per_rank),
+                "train.grad_accum_steps": int(grad_accum_steps),
+                "train.effective_train_batch_tokens": int(effective_train_batch_tokens),
+                "train.world_size": int(world_size),
+            },
+            allow_val_change=True,
+        )
+
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -205,11 +230,11 @@ def main() -> None:
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
-    logfile = None
-    if master_process:
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{run_cfg.run_id}.txt"
-        print(logfile)
+    # logfile = None
+    # if master_process:
+    #     os.makedirs("logs", exist_ok=True)
+    #     logfile = f"logs/{run_cfg.run_id}.txt"
+    #     print(logfile)
     
     def wandb_log(payload: dict, step_value: int | None = None) -> None:
         if master_process and wandb_run is not None:
@@ -250,8 +275,8 @@ def main() -> None:
             f"VOCAB_SIZE={model_cfg.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
 
-    dataset_dir = Path(data_cfg.data_path).resolve()
-    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    # dataset_dir = Path(data_cfg.data_path).resolve()
+    # actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(data_cfg.val_files, train_cfg.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, model_cfg.vocab_size, device
@@ -260,24 +285,8 @@ def main() -> None:
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
+    base_model = build_model(model_cfg, device)
 
-    base_model = GPT(
-        vocab_size=model_cfg.vocab_size,
-        num_layers=model_cfg.num_layers,
-        model_dim=model_cfg.model_dim,
-        num_heads=model_cfg.num_heads,
-        num_kv_heads=model_cfg.num_kv_heads,
-        mlp_mult=model_cfg.mlp_mult,
-        tie_embeddings=model_cfg.tie_embeddings,
-        tied_embed_init_std=model_cfg.tied_embed_init_std,
-        logit_softcap=model_cfg.logit_softcap,
-        rope_base=model_cfg.rope_base,
-        qk_gain_init=model_cfg.qk_gain_init,
-    ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -380,7 +389,11 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(train_cfg.train_batch_tokens, train_cfg.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(
+                    effective_train_batch_tokens, 
+                    train_cfg.train_seq_len, 
+                    grad_accum_steps
+                )
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -480,7 +493,11 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(train_cfg.train_batch_tokens, train_cfg.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(
+                effective_train_batch_tokens, 
+                train_cfg.train_seq_len, 
+                grad_accum_steps
+            )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -511,7 +528,7 @@ def main() -> None:
 
         # If train_batch_tokens is already your effective global batch-tokens per optimizer step,
         # this is correct. If your loader interprets it per-rank, adjust this formula.
-        train_tokens_processed += int(train_cfg.train_batch_tokens)
+        train_tokens_processed += int(effective_train_batch_tokens)
 
         step_time_ms = approx_training_time_ms / max(step, 1)
         tokens_per_sec = train_tokens_processed / max(approx_training_time_ms / 1000.0, 1e-9)

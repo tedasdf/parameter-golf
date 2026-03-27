@@ -26,9 +26,12 @@ class TrainConfig:
     warmdown_iters: int = 1200
     warmup_steps: int = 20
 
-    train_batch_tokens: int = 524_288
     train_seq_len: int = 1024
     max_wallclock_seconds: float = 600.0
+
+    # explicit batch controls
+    micro_batch_tokens_per_rank: int = 65_536
+    grad_accum_steps: int = 1
 
 
 @dataclass
