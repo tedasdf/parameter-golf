@@ -33,6 +33,10 @@ class TrainConfig:
     micro_batch_tokens_per_rank: int = 65_536
     grad_accum_steps: int = 1
 
+    checkpoint_every: int = 1000
+    checkpoint_dir: str = "artifacts/checkpoints"
+    checkpoint_prefix: str = "step"
+
 
 @dataclass
 class OptimizerConfig:
@@ -160,4 +164,3 @@ class TrainExperimentConfig:
     code: CodeConfig = field(default_factory=CodeConfig)
     quant: QuantConfig = field(default_factory=QuantConfig)
     branch: BranchConfig = field(default_factory=BranchConfig)
-    

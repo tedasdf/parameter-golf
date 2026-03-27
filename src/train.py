@@ -138,6 +138,34 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+def save_train_checkpoint(
+    checkpoint_dir: str,
+    checkpoint_prefix: str,
+    step: int,
+    train_tokens_processed: int,
+    model: nn.Module,
+    optimizer_tok: torch.optim.Optimizer,
+    optimizer_muon: torch.optim.Optimizer,
+    optimizer_scalar: torch.optim.Optimizer,
+    optimizer_head: torch.optim.Optimizer | None,
+) -> str:
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_{step:07d}.pt")
+
+    ckpt = {
+        "step": int(step),
+        "train_tokens_processed": int(train_tokens_processed),
+        "model": model.state_dict(),
+        "optimizer_tok": optimizer_tok.state_dict(),
+        "optimizer_muon": optimizer_muon.state_dict(),
+        "optimizer_scalar": optimizer_scalar.state_dict(),
+    }
+    if optimizer_head is not None:
+        ckpt["optimizer_head"] = optimizer_head.state_dict()
+
+    torch.save(ckpt, path)
+    return path
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -624,6 +652,23 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if (
+            train_cfg.checkpoint_every > 0
+            and step % train_cfg.checkpoint_every == 0
+            and master_process
+        ):
+            ckpt_path = save_train_checkpoint(
+                checkpoint_dir=train_cfg.checkpoint_dir,
+                checkpoint_prefix=train_cfg.checkpoint_prefix,
+                step=step,
+                train_tokens_processed=train_tokens_processed,
+                model=base_model,
+                optimizer_tok=optimizer_tok,
+                optimizer_muon=optimizer_muon,
+                optimizer_scalar=optimizer_scalar,
+                optimizer_head=optimizer_head,
+            )
+            print(f"saved_checkpoint: {ckpt_path}")
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         train_tokens_processed += int(effective_train_batch_tokens)
@@ -711,6 +756,8 @@ def main() -> None:
             },
             allow_val_change=True,
         )
+    
+
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------

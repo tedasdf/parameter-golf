@@ -21,7 +21,10 @@ train:
   train_batch_tokens: 524288
   train_seq_len: 1024
   max_wallclock_seconds: 600.0
-
+  checkpoint_every: 1000
+  checkpoint_dir: "artifacts/checkpoints"
+  checkpoint_prefix: "step"
+  
 optimizer:
   embed_lr: 0.6
   head_lr: 0.008
@@ -91,3 +94,11 @@ quant:
   keep_float_store_dtype: float16
   per_row_scale_dtype: float16
   clip_percentile: 99.99984
+
+branch:
+  enabled: true
+  checkpoint_path: "./artifacts/checkpoints/step_5000.pt"
+  batch_multiplier: 2.0
+  delta_tokens: 0
+  base_effective_train_batch_tokens: 524288
+  lr_scale_rule: "sqrt"
