@@ -140,6 +140,14 @@ class ArtifactProbeConfig:
     quant: QuantConfig = field(default_factory=QuantConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
 
+@dataclass
+class BranchConfig:
+    enabled: bool = False
+    checkpoint_path: str = ""
+    batch_multiplier: float = 1.0   # k
+    delta_tokens: int = 0           # if 0, set to 2 * effective_train_batch_tokens
+    base_effective_train_batch_tokens: int = 0
+    lr_scale_rule: str = "sqrt"     # for Adam
 
 @dataclass
 class TrainExperimentConfig:
@@ -151,3 +159,5 @@ class TrainExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     code: CodeConfig = field(default_factory=CodeConfig)
     quant: QuantConfig = field(default_factory=QuantConfig)
+    branch: BranchConfig = field(default_factory=BranchConfig)
+    

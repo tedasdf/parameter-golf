@@ -28,7 +28,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
-
+from helper.config_loader import parse_train_config
 from helper.quantiser import dequantize_state_dict_int8, quantize_state_dict_int8
 from model_builder import build_model
 
@@ -146,7 +146,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
 
-    cfg = TrainExperimentConfig()
+    cfg = parse_train_config()
     run_cfg = cfg.run
     data_cfg = cfg.data
     train_cfg = cfg.train
@@ -160,6 +160,8 @@ def main() -> None:
         run_cfg.run_id = str(uuid.uuid4())
 
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+
+
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
@@ -172,6 +174,10 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
     
+
+    # -----------------------------
+    # BATCH SETUP
+    # -----------------------------
     micro_batch_tokens_per_rank = train_cfg.micro_batch_tokens_per_rank
     grad_accum_steps = train_cfg.grad_accum_steps
 
@@ -193,6 +199,44 @@ def main() -> None:
     effective_train_batch_tokens = (
         micro_batch_tokens_per_rank * grad_accum_steps * world_size
     )
+    base_effective_train_batch_tokens = effective_train_batch_tokens
+
+    branch_cfg = cfg.branch
+    if branch_cfg.enabled:
+        if branch_cfg.batch_multiplier <= 0:
+            raise ValueError("branch.batch_multiplier must be > 0")
+
+        if branch_cfg.base_effective_train_batch_tokens > 0:
+            base_effective_train_batch_tokens = (
+                branch_cfg.base_effective_train_batch_tokens
+            )
+
+        effective_train_batch_tokens = int(
+            base_effective_train_batch_tokens * branch_cfg.batch_multiplier
+        )
+
+        if effective_train_batch_tokens <= 0:
+            raise ValueError("effective_train_batch_tokens must be > 0")
+        if effective_train_batch_tokens % (world_size * grad_accum_steps) != 0:
+            raise ValueError(
+                "effective_train_batch_tokens must be divisible by "
+                "world_size * grad_accum_steps"
+            )
+
+        local_tokens_per_microstep = (
+            effective_train_batch_tokens // (world_size * grad_accum_steps)
+        )
+
+        if local_tokens_per_microstep < train_cfg.train_seq_len:
+            raise ValueError(
+                "branch effective batch makes local microbatch smaller than train_seq_len"
+            )
+        if local_tokens_per_microstep % train_cfg.train_seq_len != 0:
+            raise ValueError(
+                "branch effective batch makes local microbatch not divisible by train_seq_len"
+            )
+
+
     grad_scale = 1.0 / grad_accum_steps
 
     torch.cuda.set_device(device)
@@ -219,7 +263,7 @@ def main() -> None:
             },
             allow_val_change=True,
         )
-
+       
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -288,7 +332,11 @@ def main() -> None:
     base_model = build_model(model_cfg, device)
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = (
+        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+        if distributed
+        else compiled_model
+    )
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -308,6 +356,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+
     token_lr = optim_cfg.tied_embed_lr if model_cfg.tie_embeddings else optim_cfg.embed_lr
 
     optimizer_tok = torch.optim.Adam(
@@ -333,6 +382,7 @@ def main() -> None:
         fused=True,
     )
 
+    optimizer_head = None
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
     if base_model.lm_head is not None:
@@ -343,6 +393,38 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    # Load branch checkpoint first
+    if branch_cfg.enabled:
+        ckpt = torch.load(branch_cfg.checkpoint_path, map_location="cpu")
+        base_model.load_state_dict(ckpt["model"], strict=True)
+
+        optimizer_tok.load_state_dict(ckpt["optimizer_tok"])
+        optimizer_scalar.load_state_dict(ckpt["optimizer_scalar"])
+        optimizer_muon.load_state_dict(ckpt["optimizer_muon"])
+
+        if optimizer_head is not None and "optimizer_head" in ckpt:
+            optimizer_head.load_state_dict(ckpt["optimizer_head"])
+
+    # Then apply branch LR scaling
+    if branch_cfg.enabled:
+        lr_mult = branch_cfg.batch_multiplier ** 0.5
+
+        for group in optimizer_tok.param_groups:
+            base_lr = group.get("base_lr", group["lr"])
+            group["base_lr"] = base_lr * lr_mult
+            group["lr"] = group["base_lr"]
+
+        for group in optimizer_scalar.param_groups:
+            base_lr = group.get("base_lr", group["lr"])
+            group["base_lr"] = base_lr * lr_mult
+            group["lr"] = group["base_lr"]
+
+        if optimizer_head is not None:
+            for group in optimizer_head.param_groups:
+                base_lr = group.get("base_lr", group["lr"])
+                group["base_lr"] = base_lr * lr_mult
+                group["lr"] = group["base_lr"]
 
     n_params = sum(p.numel() for p in base_model.parameters())
     print(f"model_params:{n_params}")
@@ -432,6 +514,16 @@ def main() -> None:
     peak_reserved_mb = 0.0
 
     step = 0
+    branch_tokens_budget = 0
+    branch_tokens_trained = 0
+
+    if branch_cfg.enabled:
+        branch_tokens_budget = (
+            int(branch_cfg.delta_tokens)
+            if branch_cfg.delta_tokens > 0
+            else int(2 * effective_train_batch_tokens)
+        )
+
     while True:
         last_step = step == train_cfg.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -478,12 +570,20 @@ def main() -> None:
 
         if last_step:
             if stop_after_step is not None and step < train_cfg.iterations:
-                stop_reason = "wallclock_cap"
-                cap_hit = 1
-                print(
-                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{train_cfg.iterations}"
-                )
+                if stop_reason == "branch_budget":
+                    print(
+                        f"stopping_early: branch_budget "
+                        f"branch_tokens_trained:{branch_tokens_trained} "
+                        f"branch_tokens_budget:{branch_tokens_budget} "
+                        f"step:{step}/{train_cfg.iterations}"
+                    )
+                else:
+                    stop_reason = "wallclock_cap"
+                    cap_hit = 1
+                    print(
+                        f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                        f"step:{step}/{train_cfg.iterations}"
+                    )
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -526,9 +626,13 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # If train_batch_tokens is already your effective global batch-tokens per optimizer step,
-        # this is correct. If your loader interprets it per-rank, adjust this formula.
         train_tokens_processed += int(effective_train_batch_tokens)
+
+        if branch_cfg.enabled:
+            branch_tokens_trained += int(effective_train_batch_tokens)
+            if stop_after_step is None and branch_tokens_trained >= branch_tokens_budget:
+                stop_after_step = step
+                stop_reason = "branch_budget"
 
         step_time_ms = approx_training_time_ms / max(step, 1)
         tokens_per_sec = train_tokens_processed / max(approx_training_time_ms / 1000.0, 1e-9)
@@ -566,6 +670,9 @@ def main() -> None:
                     "tokens/train_processed_total": train_tokens_processed,
                     "memory/peak_allocated_mb_so_far": float(peak_allocated_mb),
                     "memory/peak_reserved_mb_so_far": float(peak_reserved_mb),
+                    "branch/enabled": int(branch_cfg.enabled),
+                    "branch/tokens_trained": int(branch_tokens_trained),
+                    "branch/tokens_budget": int(branch_tokens_budget),
                     **lr_metrics,
                 },
                 step_value=step,
@@ -591,7 +698,19 @@ def main() -> None:
         step_value=step,
     )
 
-
+    if master_process and wandb_run is not None and branch_cfg.enabled:
+        wandb_run.config.update(
+            {
+                "branch.enabled": True,
+                "branch.checkpoint_path": branch_cfg.checkpoint_path,
+                "branch.batch_multiplier": branch_cfg.batch_multiplier,
+                "branch.base_effective_train_batch_tokens": base_effective_train_batch_tokens,
+                "branch.effective_train_batch_tokens": effective_train_batch_tokens,
+                "branch.delta_tokens": branch_tokens_budget,
+                "branch.lr_scale_rule": branch_cfg.lr_scale_rule,
+            },
+            allow_val_change=True,
+        )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
