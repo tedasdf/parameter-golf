@@ -21,7 +21,7 @@ import numpy as np
 import sentencepiece as spm
 from config import TrainExperimentConfig
 from model.optimiser import Muon
-from constant import CONTROL_TENSOR_NAME_PATTERNS, INT8_CLIP_Q, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS, INT8_KEEP_FLOAT_MAX_NUMEL, INT8_KEEP_FLOAT_STORE_DTYPE, INT8_PER_ROW_SCALE_DTYPE
+from constant import CONTROL_TENSOR_NAME_PATTERNS
 from helper.data_load import DistributedTokenLoader, load_validation_tokens
 import torch
 import torch.distributed as dist
@@ -29,7 +29,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 from helper.config_loader import parse_train_config
-from helper.quantiser import dequantize_state_dict_int8, quantize_state_dict_int8
+from helper.quantiser import dequantize_state_dict_int8, quantize_state_dict_int8, zeropower_via_newtonschulz5
 from model_builder import build_model
 
 # -----------------------------
