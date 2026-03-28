@@ -29,7 +29,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 from helper.config_loader import parse_train_config
-from helper.quantiser import dequantize_state_dict_int8, quantize_state_dict_int8, zeropower_via_newtonschulz5
+from helper.quantiser import dequantize_state_dict_int8, quantize_state_dict_int8, zeropower_via_newtoulz5
 from model_builder import build_model
 
 # -----------------------------
