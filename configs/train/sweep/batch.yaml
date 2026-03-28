@@ -7,9 +7,8 @@ metric:
   goal: minimize
 
 command:
-  - ${env}
-  - ${interpreter}
-  - ${program}
+  - .golf_param\Scripts\python.exe
+  - src/train.py
   - --config
   - configs/train.yaml
   - branch.enabled=true
