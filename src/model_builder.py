@@ -54,6 +54,7 @@ def build_model(cfg: ModelConfig, device: torch.device) -> nn.Module:
         attention_type=cfg.attention_type,
         mlp_type=cfg.mlp_type,
         norm_type=cfg.norm_type,
+        window_size=cfg.window_size,
     )
 
     model = model.to(device)

@@ -1,0 +1,22 @@
+name: local-ratio-file-sweep
+method: grid
+run_cap: 5
+
+metric:
+  name: summary/final_val_bpb
+  goal: minimize
+
+parameters:
+  config_path:
+    values:
+      - candidate/ratio15_L8_D512.yaml
+      - candidate/ratio17_L14_D384.yaml
+      - candidate/ratio20_L13_D384.yaml
+      - candidate/ratio23_L7_D512.yaml
+      - candidate/ratio27_L6_D512.yaml
+
+command:
+  - .golf_param\Scripts\python.exe
+  - src/train.py
+  - --config
+  - ${config_path}

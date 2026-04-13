@@ -100,6 +100,7 @@ class ModelConfig:
     attention_type: str = "gqa"
     mlp_type: str = "relu2"
     norm_type: str = "rmsnorm"
+    window_size: int | None = None
 
 
 @dataclass

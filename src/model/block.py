@@ -78,6 +78,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -140,6 +141,7 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+
 class MLP(nn.Module):
     """
     relu^2 MLP from the original modded-nanogpt setup
@@ -156,7 +158,6 @@ class MLP(nn.Module):
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -166,6 +167,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        window_size: int | None = None,
         attention_cls: type[nn.Module] = CausalSelfAttention,
         mlp_cls: type[nn.Module] = MLP,
         norm_cls: type[nn.Module] = RMSNorm,
@@ -180,6 +182,7 @@ class Block(nn.Module):
             num_kv_heads=num_kv_heads,
             rope_base=rope_base,
             qk_gain_init=qk_gain_init,
+            window_size=window_size,
         )
         self.mlp = mlp_cls(dim=dim, mlp_mult=mlp_mult)
 
@@ -188,7 +191,7 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
-
+        
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
